@@ -635,7 +635,7 @@ class BigramEngram(nn.Module):
         self.hash_a = [36313, 27191, 15731, 49201]
         self.hash_b = [27191, 15731, 49201, 36313]
         sp = spm.SentencePieceProcessor(model_file="./data/tokenizers/fineweb_1024_bpe.model")
-        self.remap = torch.array(build_canonical_map({sp.id_to_piece(i): i for i in range(sp.get_piece_size())}), dtype=torch.int32)
+        self.remap = torch.tensor(build_canonical_map({sp.id_to_piece(i): i for i in range(sp.get_piece_size())}), dtype=torch.int32)
 
     def bigram_hash(self, tokens: Tensor, a: int, b: int, offset: int) -> Tensor:
         t = self.remap[tokens.long()]
