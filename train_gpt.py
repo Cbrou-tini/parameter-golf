@@ -556,14 +556,15 @@ class GatedDeltaNet(nn.Module):
         v_fla = v_s.permute(0, 2, 1, 3)
 
         out, _ = chunk_gated_delta_rule(
-            q=q_fla,
-            k=k_fla,
-            v=v_fla,
-            g=g,
-            beta=beta,
-            scale=1.0,
-            head_first=False,
-        )
+                q=q_fla.float(),
+                k=k_fla.float(),
+                v=v_fla.float(),
+                g=g.float(),
+                beta=beta.float(),
+                scale=1.0,
+                head_first=False,
+            )
+        out = out.to(x.dtype)
         # out: [B, T, H, state_dim] -> [B, H, T, state_dim]
         out = out.permute(0, 2, 1, 3)
 
