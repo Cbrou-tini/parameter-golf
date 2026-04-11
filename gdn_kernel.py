@@ -1,9 +1,5 @@
 import mlx.core as mx
-
-# ==============================================================================
-# Metal kernel sources
-# ==============================================================================
-
+### metal kernel to speed up GDN testing and make it competitive for testing on my machine. 
 INTRA_SOURCE = """
     uint bh    = thread_position_in_grid.x;
     uint chunk = thread_position_in_grid.y;
@@ -35,7 +31,6 @@ INTRA_SOURCE = """
     for (uint dd = 0; dd < D; dd++)
         chunk_states[((bh * num_chunks + chunk) * D + d) * D + dd] = S_row[dd];
 """
-
 INTRA_SAVE_SOURCE = """
     uint bh    = thread_position_in_grid.x;
     uint chunk = thread_position_in_grid.y;
@@ -73,7 +68,6 @@ INTRA_SAVE_SOURCE = """
     for (uint dd = 0; dd < D; dd++)
         chunk_states[((bh * num_chunks + chunk) * D + d) * D + dd] = S_row[dd];
 """
-
 INTER_FWD_SCAN_SOURCE = """
     uint bh    = thread_position_in_grid.x;
     uint d_row = thread_position_in_grid.y;
@@ -83,7 +77,7 @@ INTER_FWD_SCAN_SOURCE = """
 
     for (uint chunk = 0; chunk < num_chunks; chunk++) {
         for (uint dc = 0; dc < D; dc++)
-            S_incoming[((bh * num_chunks + chunk) * D + d_row) * D + dc] = S_row[dc];
+            S_incoming[((bh * num_chunks + chunk) * D + d_row) * D + dc] = S_row[dc]; 
 
         float a_chunk = 1.0f;
         uint t_start = chunk * C;
@@ -94,7 +88,6 @@ INTER_FWD_SCAN_SOURCE = """
             S_row[dc] = a_chunk * S_row[dc] + chunk_states[((bh * num_chunks + chunk) * D + d_row) * D + dc];
     }
 """
-
 INTRA_BWD_SOURCE = """
     uint bh    = thread_position_in_grid.x;
     uint chunk = thread_position_in_grid.y;
@@ -169,7 +162,6 @@ INTRA_BWD_SOURCE = """
                                    db_local[i], memory_order_relaxed);
     }
 """
-
 INTER_BWD_FUSED_SOURCE = """
     uint bh    = thread_position_in_grid.x;
     uint d_row = thread_position_in_grid.y;
@@ -204,12 +196,9 @@ INTER_BWD_FUSED_SOURCE = """
             dS_row[dc] = a_chunk * dS_row[dc] + dS_local[((bh * num_chunks + chunk) * D + d_row) * D + dc];
     }
 """
-
 _fwd_kernel_cache: dict = {}
 _bwd_kernel_cache: dict = {}
 _scan_kernel_cache: dict = {}
-
-
 def _get_fwd_kernels(D):
     if D not in _fwd_kernel_cache:
         header = f"#define C 64\n#define D {D}\n"
@@ -229,8 +218,6 @@ def _get_fwd_kernels(D):
         )
         _fwd_kernel_cache[D] = (intra, intra_save)
     return _fwd_kernel_cache[D]
-
-
 def _get_scan_kernel(D):
     if D not in _scan_kernel_cache:
         header = f"#define C 64\n#define D {D}\n"
@@ -243,8 +230,6 @@ def _get_scan_kernel(D):
         )
         _scan_kernel_cache[D] = scan
     return _scan_kernel_cache[D]
-
-
 def _get_bwd_kernels(D):
     if D not in _bwd_kernel_cache:
         header = f"#define C 64\n#define D {D}\n"
@@ -267,8 +252,6 @@ def _get_bwd_kernels(D):
         )
         _bwd_kernel_cache[D] = (intra_bwd, inter_bwd_fused)
     return _bwd_kernel_cache[D]
-
-
 def gdn_forward_and_save(k_s, v_s, q_s, beta, alpha, C=64):
     BH, T, D = k_s.shape
     assert T % C == 0
@@ -316,11 +299,9 @@ def gdn_forward_and_save(k_s, v_s, q_s, beta, alpha, C=64):
 
     return intra_out, S_hist, delta_hist, S_incoming
 
-
 def gdn_chunkwise_scan(k_s, v_s, q_s, beta, alpha, C=64):
     out, _, _, _ = gdn_forward_and_save(k_s, v_s, q_s, beta, alpha, C)
     return out
-
 
 def gdn_backward_metal(dout, k_s, v_s, q_s, beta, alpha, S_hist, delta_hist, S_incoming, C=64):
     BH, T, D = k_s.shape
@@ -379,11 +360,9 @@ def gdn_backward_metal(dout, k_s, v_s, q_s, beta, alpha, S_hist, delta_hist, S_i
 
     return dk, dv, dq, dbeta, dalpha
 
-
 def gdn_backward(dout, k_s, v_s, q_s, beta, alpha):
     _, S_hist, delta_hist, S_incoming = gdn_forward_and_save(k_s, v_s, q_s, beta, alpha)
     return gdn_backward_metal(dout, k_s, v_s, q_s, beta, alpha, S_hist, delta_hist, S_incoming)
-
 
 @mx.custom_function
 def gdn_forward_custom(k_s, v_s, q_s, beta, alpha):
@@ -399,7 +378,6 @@ def gdn_vjp(primals, cotangents, output):
     )
     return (dk.astype(k_s.dtype), dv.astype(v_s.dtype), dq.astype(q_s.dtype),
             dbeta.astype(beta.dtype), dalpha.astype(alpha.dtype))
-
 
 def gdn_reference(k_s, v_s, q_s, beta, alpha):
     BH, T, D = k_s.shape
