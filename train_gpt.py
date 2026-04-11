@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+import zstandard as zstd
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -954,26 +955,23 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    cctx = zstd.ZstdCompressor(level=22)
+    quant_blob = cctx.compress(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(f"Serialized model int8+zlib: {quant_file_bytes} bytes (payload_ratio:{ratio:.2f}x)")
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
-
+        log0(f"Serialized model int8+zstd: {quant_file_bytes} bytes (payload_ratio:{ratio:.2f}x)")
+        log0(f"Total submission size int8+zstd: {quant_file_bytes + code_bytes} bytes")
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    dctx = zstd.ZstdDecompressor()
+    quant_state = torch.load(io.BytesIO(dctx.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
-                                     val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
     torch.cuda.synchronize()
     log0(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
          f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
