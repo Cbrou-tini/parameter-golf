@@ -565,8 +565,7 @@ class GatedDeltaNet(nn.Module):
                 v=v_fla.float(),
                 g=g.float(),
                 beta=beta.float(),
-                scale=1.0,
-                head_first=False,
+                scale=1.0
             )
         out = out.to(x.dtype)
         # out: [B, T, H, state_dim] -> [B, H, T, state_dim]
@@ -976,7 +975,7 @@ def main() -> None:
     quant_state = torch.load(io.BytesIO(dctx.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
-    _qeval = time.perf_counter()
+    t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
         model,
