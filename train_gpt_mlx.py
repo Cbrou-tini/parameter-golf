@@ -5,7 +5,7 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
 from __future__ import annotations
-
+from gdn_kernel import gdn_forward_custom
 import glob
 import json
 import math
@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import sentencepiece as spm
+import unicodedata
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,7 +59,7 @@ class Hyperparameters:
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
-    mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
+    mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 16_384))
     # Force MLX to materialize the graph after every sub-batch, preventing lazy
     # graph buildup across accumulation steps. Keeps peak memory low on 16GB machines.
     # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
@@ -68,12 +69,12 @@ class Hyperparameters:
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
-    vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
-    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
-    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024)) 
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 8))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 384))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 6))
+    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 3))
+    mlp_mult: int = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -85,14 +86,14 @@ class Hyperparameters:
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
     adam_eps: float = float(os.environ.get("ADAM_EPS", 1e-8))
-    tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.05))
-    matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
+    tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.005))
+    matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.004))
+    scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.004))
     muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -287,35 +288,20 @@ class CastedLinear(nn.Module):
 
 
 class RMSNormNoWeight(nn.Module):
-    # MLX module wrapper around the functional RMSNorm helper so it composes nicely in blocks.
     def __call__(self, x: mx.array) -> mx.array:
         return rms_norm(x)
 
 
 class CausalSelfAttention(nn.Module):
-    # - separate q/k/v projections
-    # - RMSNorm on q and k before attention
-    # - RoPE on q and k
-    # - causal masked SDPA
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("model_dim must be divisible by num_heads")
-        if num_heads % num_kv_heads != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
+        assert dim % num_heads == 0
+        assert num_heads % num_kv_heads == 0
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
+        assert self.head_dim % 2 == 0
+        kv_dim = num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, kv_dim)
         self.c_v = CastedLinear(dim, kv_dim)
@@ -329,7 +315,6 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
@@ -339,7 +324,6 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = dim * mlp_mult
@@ -347,20 +331,12 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
+        x = nn.leaky_relu(self.fc(x))
         return self.proj(x * x)
 
 
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
@@ -368,108 +344,262 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        self.resid_mix = mx.array(
+            np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32)))
+        )
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
-class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+def l2norm(x, dim=-1, eps=1e-6):
+    return x * mx.rsqrt((x * x).sum(axis=dim, keepdims=True) + eps)
+
+
+class GatedDeltaNet(nn.Module):
+    def __init__(self, d_in, d_out, num_heads, state_dim=32, dtype=mx.bfloat16):
         super().__init__()
-        if logit_softcap <= 0.0:
-            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        assert d_out % num_heads == 0
+        self.d_out = d_out
+        self.num_heads = num_heads
+        self.head_dim = d_out // num_heads
+        self.state_dim = state_dim
+        self.dtype = dtype
+        self.W_query = CastedLinear(d_in, d_out)
+        self.W_key = CastedLinear(d_in, d_out)
+        self.W_value = CastedLinear(d_in, d_out)
+        self.W_out = CastedLinear(d_out, d_out)
+        self.W_gate = CastedLinear(d_in, d_out)
+        self.W_beta = CastedLinear(d_in, num_heads)
+        self.W_alpha = CastedLinear(d_in, num_heads)
+        self.W_k_state = CastedLinear(self.head_dim, state_dim)
+        self.W_v_state = CastedLinear(self.head_dim, state_dim)
+        self.W_q_state = CastedLinear(self.head_dim, state_dim)
+        self.W_out_state = CastedLinear(state_dim, self.head_dim)
+        self.norm = RMSNormNoWeight()
+
+    def __call__(self, x: mx.array) -> mx.array:
+        B, T, _ = x.shape
+        x = x.astype(self.dtype)
+        q = self.W_query(x).reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.W_key(x).reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.W_value(x).reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k_s = l2norm(self.W_k_state(k))
+        v_s = self.W_v_state(v)
+        q_s = self.W_q_state(q)
+        beta = mx.sigmoid(self.W_beta(x)).transpose(0, 2, 1)
+        alpha = mx.exp(-nn.softplus(self.W_alpha(x))).transpose(0, 2, 1)
+        BH = B * self.num_heads
+        k_s = k_s.reshape(BH, T, self.state_dim)
+        v_s = v_s.reshape(BH, T, self.state_dim)
+        q_s = q_s.reshape(BH, T, self.state_dim)
+        beta_bh = beta.reshape(BH, T)
+        alpha_bh = alpha.reshape(BH, T)
+        out = gdn_forward_custom(k_s, v_s, q_s, beta_bh, alpha_bh)
+        out = out.reshape(B, self.num_heads, T, self.state_dim).transpose(0, 2, 1, 3)
+        out = out.reshape(B, T, self.num_heads, self.state_dim)
+        out = self.W_out_state(out).reshape(B, T, self.d_out).astype(self.dtype)
+        out = self.norm(out)
+        gate = nn.silu(self.W_gate(x))
+        return self.W_out(out * gate)
+
+class GatedDeltaNetBlock(nn.Module):
+    def __init__(self, hidden_dim, num_heads, mlp_mult, state_dim=32, dtype=mx.bfloat16):
+        super().__init__()
+        self.gdn = GatedDeltaNet(hidden_dim, hidden_dim, num_heads, state_dim=state_dim, dtype=dtype)
+        self.norm1 = RMSNormNoWeight()
+        self.mlp = MLP(hidden_dim, mlp_mult)
+        self.norm2 = RMSNormNoWeight()
+        self.resid_mix = mx.array(
+            np.stack((np.ones((hidden_dim,), dtype=np.float32), np.zeros((hidden_dim,), dtype=np.float32)))
+        )
+
+    def __call__(self, x: mx.array, x0: mx.array = None) -> mx.array:
+        if x0 is not None:
+            mix = self.resid_mix.astype(x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = x + self.gdn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+    
+def build_canonical_map(vocab: dict[str, int]) -> list[int]:
+    n = len(vocab)
+    canonical = {}
+    for token, idx in sorted(vocab.items(), key=lambda x: x[1]):
+        norm = unicodedata.normalize("NFKC", token).lower().lstrip("▁ ")
+        if norm not in canonical:
+            canonical[norm] = idx
+    
+    remap = list(range(n))
+    for token, idx in vocab.items():
+        norm = unicodedata.normalize("NFKC", token).lower().lstrip("▁ ")
+        target = canonical[norm]
+        remap[idx] = target if target < n else idx  # fallback to identity
+    
+    return remap
+
+class EngramGating(nn.Module):
+    def __init__(self, engram_dim, model_dim, kernel_size=4):
+        super().__init__()
+        self.W_K = CastedLinear(engram_dim, model_dim)
+        self.W_V = CastedLinear(engram_dim, model_dim)
+        self.scale = model_dim ** -0.5
+        # depthwise causal conv over the gated output
+        self.conv = nn.Conv1d(
+            in_channels=model_dim,
+            out_channels=model_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size - 1,  # causal: pad left only
+            groups=model_dim,         # depthwise
+        )
+        
+
+    def __call__(self, h, e):
+        k = rms_norm(self.W_K(e))
+        q = rms_norm(h)
+        alpha = mx.sigmoid((q * k).sum(axis=-1, keepdims=True) * self.scale)
+        v = alpha * self.W_V(e)
+        # causal conv: trim right padding to keep sequence length
+        v = self.conv(v)[..., :v.shape[-2], :]  # [B, T, model_dim]
+        return nn.silu(v)
+    
+class BigramEngram(nn.Module):
+    def __init__(self, vocab_size, engram_dim, model_dim, num_buckets=10240, num_heads=4):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.mask = num_buckets - 1
+        self.num_heads = num_heads
+        head_dim = engram_dim // num_heads
+
+        # fix: single table with offset, no list
+        self.embed = nn.Embedding(num_buckets * num_heads, head_dim)
+        self.embed.weight = mx.zeros_like(self.embed.weight)
+
+        self.gating = EngramGating(engram_dim, model_dim)
+
+        self.hash_a = [36313, 27191, 15731, 49201]
+        self.hash_b = [27191, 15731, 49201, 36313]
+        sp = spm.SentencePieceProcessor(model_file="./data/tokenizers/fineweb_1024_bpe.model")
+        self.remap = mx.array(build_canonical_map({sp.id_to_piece(i): i for i in range(sp.get_piece_size())}), dtype=mx.int32)
+
+    def bigram_hash(self, tokens, a, b, offset):
+        t = self.remap[tokens.astype(mx.int32)].astype(mx.int32) 
+        mod = self.num_buckets - 1
+        hashed = (a * t[..., 1:]) ^ (b * t[..., :-1])
+        hashed = mx.abs(hashed) & self.mask + offset
+        first = mx.full((*t.shape[:-1], 1), mod + offset, dtype=mx.int32)
+        return mx.concatenate([first, hashed], axis=-1)
+
+    def __call__(self, token_ids, h):  # fix: h passed in
+        parts = [
+            self.embed(self.bigram_hash(token_ids, self.hash_a[i], self.hash_b[i], i * self.num_buckets))
+            for i in range(self.num_heads)
+        ]
+        e = mx.concatenate(parts, axis=-1)  # [B, T, engram_dim]
+        return self.gating(h, e)
+
+class BlockList(nn.Module):
+    def __init__(self, blocks):
+        super().__init__()
+        self.layers = blocks
+
+    def __call__(self, x, x0=None):
+        for block in self.layers:
+            x = block(x, x0=x0)
+        return x
+
+# ==============================================================================
+# GPT MODEL
+# ==============================================================================
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size, num_layers, dim, num_heads, num_kv_heads, mlp_mult,
+                 logit_chunk_tokens, logit_softcap, rope_base, tied_embed_init_std, qk_gain_init):
+        super().__init__()
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
-        ]
-        self.final_norm = RMSNormNoWeight()
-
-        for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
 
-    def softcap(self, logits: mx.array) -> mx.array:
+        self.engram = BigramEngram(vocab_size, engram_dim=dim, model_dim=dim, num_buckets= 10240, num_heads= num_kv_heads)
+
+        # 1 ATT followed by 3 GDN, repeated num_layers//4 times
+        self.blocks = []
+        for _ in range(num_layers // 4):
+            for _ in range(1):
+                self.blocks.append(Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init))
+            for _ in range(3):
+                self.blocks.append(GatedDeltaNetBlock(dim, num_heads, mlp_mult, state_dim=16))
+
+        # zero init output projections
+        for b in self.blocks:
+            if isinstance(b, Block):
+                b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+                b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            elif isinstance(b, GatedDeltaNetBlock):
+                b.gdn.W_out.weight = mx.zeros_like(b.gdn.W_out.weight)
+                b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+
+        self.final_norm = RMSNormNoWeight()
+
+    def softcap(self, logits):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids):
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
-        skips: list[mx.array] = []
-
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        for i, b in enumerate(self.blocks):
+            if i == 1:
+                x = x + self.engram(input_ids, x)
+            x = b(x, x0) if isinstance(b, Block) else b(x, x0=x0)
         return self.final_norm(x)
 
-    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
+    def loss(self, input_ids, target_ids):
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
+            logits = self.softcap(x @ self.tok_emb.weight.astype(x.dtype).T)
             return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
-
         loss_sum = mx.array(0.0, dtype=mx.float32)
         n = int(x.shape[0])
         for s in range(0, n, self.logit_chunk_tokens):
             e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
+            logits = self.softcap(x[s:e] @ self.tok_emb.weight.astype(x.dtype).T)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
 
 # ==============================================================================
-# OPTIMIZERS (MUON + ADAM SPLIT)
+# OPTIMIZERS
 # ==============================================================================
+
+CONTROL_TENSOR_NAME_PATTERNS = (
+    "attn_scale", "mlp_scale", "resid_mix", "q_gain",
+    "skip_weight", "skip_mix", "W_beta", "W_alpha",
+)
+
+
 class Muon:
-    # Muon applies SGD-momentum to matrix gradients, then orthogonalizes the result before the
-    # parameter update.
-    def __init__(self, keys: list[str], params: dict[str, mx.array], args: Hyperparameters):
+    def __init__(self, keys, params, args):
         self.keys = keys
         self.args = args
         self.buffers = {k: mx.zeros_like(params[k]) for k in keys}
 
-    def step(self, params: dict[str, mx.array], grads: dict[str, mx.array], step: int, lr_mul: float) -> dict[str, mx.array]:
+    def step(self, params, grads, step, lr_mul):
         if self.args.muon_momentum_warmup_steps:
             t = min(step / self.args.muon_momentum_warmup_steps, 1.0)
             momentum = (1.0 - t) * self.args.muon_momentum_warmup_start + t * self.args.muon_momentum
         else:
             momentum = self.args.muon_momentum
         lr = self.args.matrix_lr * lr_mul
-        out: dict[str, mx.array] = {}
+        out = {}
         for k in self.keys:
             p = params[k]
             g = grads[k]
@@ -483,25 +613,22 @@ class Muon:
 
 
 class SplitOptimizers:
-    # - embeddings: Adam with the tied-embedding LR
-    # - block matrices (2D): Muon
-    # - block scalars + skip weights: Adam
-    # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
         self.embed_key = "tok_emb.weight"
         self.matrix_keys = [
-            k
-            for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            k for k, p in params.items()
+            if p.ndim == 2
+            and not any(pat in k for pat in CONTROL_TENSOR_NAME_PATTERNS)
+            and k != self.embed_key
+            and "norm" not in k
+            and "embed" not in k
         ]
         self.scalar_keys = [
-            k
-            for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            k for k, p in params.items()
+            if k != self.embed_key and k not in self.matrix_keys
         ]
-
         self.muon = Muon(self.matrix_keys, params, args)
         self.adam_embed = optim.Adam(
             learning_rate=args.tied_embed_lr,
@@ -520,22 +647,17 @@ class SplitOptimizers:
         params = dict(tree_flatten(model.parameters()))
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
-
         updated.update(self.muon.step(params, grads, step=step, lr_mul=lr_mul))
-
         self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
-        updated.update(
-            self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
-            )
-        )
-
+        updated.update(self.adam_embed.apply_gradients(
+            {self.embed_key: grads[self.embed_key]},
+            {self.embed_key: params[self.embed_key]},
+        ))
         self.adam_scalar.learning_rate = self.args.scalar_lr * lr_mul
-        scalar_grads = {k: grads[k] for k in self.scalar_keys}
-        scalar_params = {k: params[k] for k in self.scalar_keys}
-        updated.update(self.adam_scalar.apply_gradients(scalar_grads, scalar_params))
-
+        updated.update(self.adam_scalar.apply_gradients(
+            {k: grads[k] for k in self.scalar_keys},
+            {k: params[k] for k in self.scalar_keys},
+        ))
         model.update(tree_unflatten(list(updated.items())))
 
 # ==============================================================================
@@ -943,20 +1065,7 @@ def main() -> None:
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
-    log(
-        f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
-        f"embed_lr:{args.tied_embed_lr} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
-    )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
-    log(
-        f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
-    )
-
     # ==============================================================================
     # TRAINING LOOP
     # ==============================================================================
@@ -1027,7 +1136,6 @@ def main() -> None:
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
         step_t0 = time.perf_counter()
-
         accum: dict[str, mx.array] | None = None
         train_loss = mx.array(0.0, dtype=mx.float32)
         grad_scale = 1.0 / args.grad_accum_steps
