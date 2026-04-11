@@ -640,8 +640,8 @@ class BigramEngram(nn.Module):
     def bigram_hash(self, tokens: Tensor, a: int, b: int, offset: int) -> Tensor:
         t = self.remap[tokens.long()]
         hashed = ((a * t[..., 1:]) ^ (b * t[..., :-1])).abs() & self.mask
-        first = torch.full((*t.shape[:-1], 1), self.mask + offset, dtype=torch.long, device=tokens.device)
-        return torch.cat([first, hashed + offset], dim=-1)
+        first = torch.full((*t.shape[:-1], 1), self.mask + offset, dtype=t.dtype, device=t.device)
+        return torch.cat([first, (hashed + offset).to(dtype=t.dtype)], dim=-1)
 
     def forward(self, token_ids: Tensor, h: Tensor) -> Tensor:
         parts = [self.embed(self.bigram_hash(token_ids, self.hash_a[i], self.hash_b[i], i * self.num_buckets))
