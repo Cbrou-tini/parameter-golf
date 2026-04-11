@@ -638,7 +638,7 @@ class BigramEngram(nn.Module):
         self.remap = torch.tensor(build_canonical_map({sp.id_to_piece(i): i for i in range(sp.get_piece_size())}), dtype=torch.int32)
 
     def bigram_hash(self, tokens: Tensor, a: int, b: int, offset: int) -> Tensor:
-        t = self.remap[tokens.long()]
+        t = self.remap.to(tokens.device)[tokens.long()]
         hashed = ((a * t[..., 1:]) ^ (b * t[..., :-1])).abs() & self.mask
         first = torch.full((*t.shape[:-1], 1), self.mask + offset, dtype=t.dtype, device=t.device)
         return torch.cat([first, (hashed + offset).to(dtype=t.dtype)], dim=-1)
