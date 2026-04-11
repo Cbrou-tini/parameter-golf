@@ -364,10 +364,12 @@ class TokenStream:
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
 
-    def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        self.pos = 0
+    def _advance_file(self):
+    self.file_idx = (self.file_idx + 1) % len(self.files)
+    if self.file_idx == 0:
+        random.shuffle(self.files)  # reshuffle on epoch boundary
+    self.tokens = load_data_shard(self.files[self.file_idx])
+    self.pos = 0
 
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
