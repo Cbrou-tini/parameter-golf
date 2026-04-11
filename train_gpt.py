@@ -365,12 +365,12 @@ class TokenStream:
         self.pos = 0
 
     def _advance_file(self):
-    self.file_idx = (self.file_idx + 1) % len(self.files)
-    if self.file_idx == 0:
-        print(f"exhausted all {len(self.files)} shards, cycling back to start (pos={self.pos})")
-        random.shuffle(self.files)  # reshuffle on epoch boundary
-    self.tokens = load_data_shard(self.files[self.file_idx])
-    self.pos = 0
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        if self.file_idx == 0:
+            print(f"exhausted all {len(self.files)} shards, cycling back to start (pos={self.pos})")
+            random.shuffle(self.files)  # reshuffle on epoch boundary
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = 0
 
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
