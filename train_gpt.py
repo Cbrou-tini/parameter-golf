@@ -526,6 +526,7 @@ def gdn_forward_sequential(k: Tensor, v: Tensor, q: Tensor,
         out[:, t] = (q[:, t, :, None] * S).sum(dim=-1)
     return out
 
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 class GatedDeltaNet(nn.Module):
     def __init__(self, d_in: int, d_out: int, num_heads: int, state_dim: int = 32):
@@ -535,38 +536,54 @@ class GatedDeltaNet(nn.Module):
         self.head_dim = d_out // num_heads
         self.state_dim = state_dim
         self.W_query = CastedLinear(d_in, d_out, bias=False)
-        self.W_key = CastedLinear(d_in, d_out, bias=False)
+        self.W_key   = CastedLinear(d_in, d_out, bias=False)
         self.W_value = CastedLinear(d_in, d_out, bias=False)
-        self.W_out = CastedLinear(d_out, d_out, bias=False)
+        self.W_out   = CastedLinear(d_out, d_out, bias=False)
         self.W_out._zero_init = True
-        self.W_gate = CastedLinear(d_in, d_out, bias=False)
-        self.W_beta = CastedLinear(d_in, num_heads, bias=False)
+        self.W_gate  = CastedLinear(d_in, d_out, bias=False)
+        self.W_beta  = CastedLinear(d_in, num_heads, bias=False)
         self.W_alpha = CastedLinear(d_in, num_heads, bias=False)
-        self.W_k_state = CastedLinear(self.head_dim, state_dim, bias=False)
-        self.W_v_state = CastedLinear(self.head_dim, state_dim, bias=False)
-        self.W_q_state = CastedLinear(self.head_dim, state_dim, bias=False)
+        self.W_k_state   = CastedLinear(self.head_dim, state_dim, bias=False)
+        self.W_v_state   = CastedLinear(self.head_dim, state_dim, bias=False)
+        self.W_q_state   = CastedLinear(self.head_dim, state_dim, bias=False)
         self.W_out_state = CastedLinear(state_dim, self.head_dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
+
         q = self.W_query(x).reshape(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k = self.W_key(x).reshape(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = self.W_value(x).reshape(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # project into state space: [B, H, T, state_dim]
         k_s = F.normalize(self.W_k_state(k), dim=-1)
         v_s = self.W_v_state(v)
-        q_s = F.normalize(self.W_q_state(q), dim=-1)
-        beta = torch.sigmoid(self.W_beta(x)).permute(0, 2, 1)
-        alpha = torch.exp(-F.softplus(self.W_alpha(x))).permute(0, 2, 1)
-        BH = B * self.num_heads
-        out = gdn_forward_sequential(
-            k_s.reshape(BH, T, self.state_dim), v_s.reshape(BH, T, self.state_dim),
-            q_s.reshape(BH, T, self.state_dim), beta.reshape(BH, T), alpha.reshape(BH, T),
+        q_s = self.W_q_state(q)
+
+        # beta: [B, T, H], g = log(alpha): [B, T, H]
+        beta = torch.sigmoid(self.W_beta(x))                    # (B, T, H)
+        g    = -F.softplus(self.W_alpha(x))                     # (B, T, H), log of alpha in (0,1)
+
+        # FLA expects head-last seq-first: [B, T, H, D]
+        q_fla = q_s.permute(0, 2, 1, 3)   # [B, T, H, state_dim]
+        k_fla = k_s.permute(0, 2, 1, 3)
+        v_fla = v_s.permute(0, 2, 1, 3)
+
+        out, _ = chunk_gated_delta_rule(
+            q=q_fla,
+            k=k_fla,
+            v=v_fla,
+            g=g,
+            beta=beta,
+            scale=1.0,
+            head_first=False,
         )
-        out = out.reshape(B, self.num_heads, T, self.state_dim).permute(0, 2, 1, 3)
+        # out: [B, T, H, state_dim] -> [B, H, T, state_dim]
+        out = out.permute(0, 2, 1, 3)
+
         out = self.W_out_state(out).reshape(B, T, self.d_out)
         out = F.rms_norm(out, (out.size(-1),))
         return self.W_out(out * F.silu(self.W_gate(x)))
-
 
 class GatedDeltaNetBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_mult: int, state_dim: int = 32):
