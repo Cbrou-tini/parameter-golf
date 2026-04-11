@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -512,21 +513,6 @@ class Block(nn.Module):
 # -----------------------------
 # GATED DELTA NET
 # -----------------------------
-
-def gdn_forward_sequential(k: Tensor, v: Tensor, q: Tensor,
-                           beta: Tensor, alpha: Tensor) -> Tensor:
-    """Sequential linear-attention scan. k,v,q: [BH,T,D], beta,alpha: [BH,T]."""
-    BH, T, D = k.shape
-    S = torch.zeros(BH, D, D, device=k.device, dtype=torch.float32)
-    out = torch.zeros_like(q)
-    for t in range(T):
-        a = alpha[:, t, None, None]
-        b = beta[:, t, None, None]
-        S = a * S + b * (k[:, t, :, None] * v[:, t, None, :])
-        out[:, t] = (q[:, t, :, None] * S).sum(dim=-1)
-    return out
-
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 class GatedDeltaNet(nn.Module):
     def __init__(self, d_in: int, d_out: int, num_heads: int, state_dim: int = 32):
