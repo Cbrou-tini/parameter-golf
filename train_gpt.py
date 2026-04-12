@@ -27,7 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule ### Potential issues causing the complete loss collapse 
 import zstandard as zstd
 
 # -----------------------------
@@ -559,14 +559,23 @@ class GatedDeltaNet(nn.Module):
         k_fla = k_s.permute(0, 2, 1, 3)
         v_fla = v_s.permute(0, 2, 1, 3)
 
-        out, _ = chunk_gated_delta_rule(
+        #out, _ = chunk_gated_delta_rule(
+               # q=q_fla.float(),
+               # k=k_fla.float(),
+               # v=v_fla.float(),
+               # g=g.float(),
+               # beta=beta.float(),
+               # scale=1.0
+           # )
+        ### FIX test even if slower
+        out, _ = fused_recurrent_gated_delta_rule(
                 q=q_fla.float(),
                 k=k_fla.float(),
                 v=v_fla.float(),
                 g=g.float(),
                 beta=beta.float(),
                 scale=1.0
-            )
+                )
         out = out.to(x.dtype)
         # out: [B, T, H, state_dim] -> [B, H, T, state_dim]
         out = out.permute(0, 2, 1, 3)
