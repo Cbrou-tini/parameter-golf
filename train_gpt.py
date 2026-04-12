@@ -620,7 +620,7 @@ class EngramGating(nn.Module):
                               padding=kernel_size - 1, groups=model_dim)
 
     def forward(self, h: Tensor, e: Tensor) -> Tensor:
-        k = F.rms_norm(self.W_K(e), (e.size(-1),))
+        k = F.rms_norm(self.W_K(e), (self.W_K.weight.size(0),))
         q = F.rms_norm(h, (h.size(-1),))
         alpha = torch.sigmoid((q * k).sum(dim=-1, keepdim=True) * self.scale)
         v = alpha * self.W_V(e)
