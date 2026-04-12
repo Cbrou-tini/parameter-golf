@@ -669,14 +669,14 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.engram = BigramEngram(vocab_size, engram_dim=model_dim, model_dim=model_dim,
+        self.engram = BigramEngram(vocab_size, engram_dim=128, model_dim=model_dim, #Reduced because of to amny empty buckets
                                    num_buckets=10240, num_heads=num_kv_heads, tokenizer=tokenizer)
         # 1 ATT + 3 GDN repeated num_layers//4 times
         self.blocks = nn.ModuleList()
         for _ in range(num_layers // 4):
             self.blocks.append(Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init))
             for _ in range(3):
-                self.blocks.append(GatedDeltaNetBlock(model_dim, num_heads, mlp_mult, state_dim=48)) #Reduced to fit
+                self.blocks.append(GatedDeltaNetBlock(model_dim, num_heads, mlp_mult, state_dim=64))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
