@@ -490,7 +490,7 @@ class BigramEngram(nn.Module):
         t = self.remap[tokens.astype(mx.int32)].astype(mx.int32) 
         mod = self.num_buckets - 1
         hashed = (a * t[..., 1:]) ^ (b * t[..., :-1])
-        hashed = mx.abs(hashed) & self.mask + offset
+        hashed = mx.abs(hashed) & self.mask + offset  
         first = mx.full((*t.shape[:-1], 1), mod + offset, dtype=mx.int32)
         return mx.concatenate([first, hashed], axis=-1)
 
