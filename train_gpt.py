@@ -537,39 +537,34 @@ class GatedDeltaNet(nn.Module):
         self.W_v_state   = CastedLinear(self.head_dim, state_dim, bias=False)
         self.W_q_state   = CastedLinear(self.head_dim, state_dim, bias=False)
         self.W_out_state = CastedLinear(state_dim, self.head_dim, bias=False)
-    
-    def forward(self, x: Tensor) -> Tensor:
+
+   def forward(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
-    
         q = self.W_query(x).reshape(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k = self.W_key(x).reshape(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = self.W_value(x).reshape(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
     
-        # project into state space: [B, H, T, state_dim]
         k_s = F.normalize(self.W_k_state(k), dim=-1)
         v_s = self.W_v_state(v)
         q_s = self.W_q_state(q)
     
-        # beta: [B, H, T], g = log(alpha): [B, H, T]
-        beta = torch.sigmoid(self.W_beta(x)).permute(0, 2, 1)   # (B, T, H) -> (B, H, T)
-        g = (-F.softplus(self.W_alpha(x))).permute(0, 2, 1)      # (B, T, H) -> (B, H, T)
+        beta = torch.sigmoid(self.W_beta(x))     # (B, T, H) ← keep as-is
+        g = -F.softplus(self.W_alpha(x))          # (B, T, H) ← keep as-is
     
-        # q_s/k_s/v_s already (B, H, T, state_dim) — FLA expects (B, H, T, D)
+        q_fla = q_s.permute(0, 2, 1, 3)          # (B, T, H, state_dim) ← keep
+        k_fla = k_s.permute(0, 2, 1, 3)
+        v_fla = v_s.permute(0, 2, 1, 3)
+    
         out, _ = chunk_gated_delta_rule(
-            q=q_s.float(),
-            k=k_s.float(),
-            v=v_s.float(),
-            g=g.float(),
-            beta=beta.float(),
-            scale=1.0
+            q=q_fla.float(), k=k_fla.float(), v=v_fla.float(),
+            g=g.float(), beta=beta.float(), scale=1.0
         )
         out = out.to(x.dtype)
     
-        # out: [B, H, T, state_dim] -> [B, T, H, state_dim]
-        out = out.permute(0, 2, 1, 3)
+        # FLA returns (B, T, H, state_dim) — reshape directly, NO permute
         out = self.W_out_state(out).reshape(B, T, self.d_out)
         out = F.rms_norm(out, (out.size(-1),))
-
+    
         return self.W_out(out * F.silu(self.W_gate(x)))
 
 class GatedDeltaNetBlock(nn.Module):
