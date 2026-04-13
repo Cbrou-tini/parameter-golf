@@ -682,8 +682,6 @@ class GPT(nn.Module):
             if i == 1:
                 x = x + self.engram(input_ids, x)
             x = block(x, x0)
-        for block in self.blocks[4:6]: ### Recursion like winning models 
-            x = block(x, x0)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
