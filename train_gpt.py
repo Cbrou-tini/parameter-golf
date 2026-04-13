@@ -661,7 +661,7 @@ class GPT(nn.Module):
         for _ in range(num_layers // 4):
             self.blocks.append(Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init))
             for _ in range(3):
-                self.blocks.append(GatedDeltaNetBlock(model_dim, num_heads, mlp_mult, state_dim=32)) #Be good for submission
+                self.blocks.append(GatedDeltaNetBlock(model_dim, num_heads, mlp_mult, state_dim=64)) #Be good for submission
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
