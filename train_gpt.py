@@ -654,8 +654,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.engram = BigramEngram(vocab_size, engram_dim=96, model_dim=model_dim, #Reduced because of to amny empty buckets
-                                   num_buckets=10240, num_heads=3, tokenizer=tokenizer)
+        self.engram = BigramEngram(vocab_size, engram_dim=64, model_dim=model_dim, #Reduced because of to amny empty buckets
+                                   num_buckets=10240, num_heads=2, tokenizer=tokenizer)
         # 1 ATT + 3 GDN repeated num_layers//4 times
         self.blocks = nn.ModuleList()
         for _ in range(num_layers // 4):
